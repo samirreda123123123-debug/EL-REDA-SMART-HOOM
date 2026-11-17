@@ -35,9 +35,18 @@ jobs:
           npx cap add android
           npx cap sync android
 
-      - name: Allow HTTP (Cleartext) for ESP8266 local IP
+      - name: Allow HTTP and Fix Kotlin Duplicate Class
         run: |
           sed -i 's/<application/<application android:usesCleartextTraffic="true"/' android/app/src/main/AndroidManifest.xml
+          cat << 'EOF' >> android/app/build.gradle
+          configurations.all {
+              resolutionStrategy {
+                  force 'org.jetbrains.kotlin:kotlin-stdlib:1.8.22'
+                  force 'org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.8.22'
+                  force 'org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.8.22'
+              }
+          }
+          EOF
 
       - name: Build Debug APK
         run: |
