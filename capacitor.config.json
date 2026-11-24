@@ -1,0 +1,14 @@
+{
+  "appId": "com.alreda.smarthome",
+  "appName": "الرضا سمارت هوم",
+  "webDir": "dist",
+  "server": {
+    "androidScheme": "http",
+    "cleartext": true
+  },
+  "plugins": {
+    "CapacitorHttp": {
+      "enabled": true
+    }
+  }
+}
