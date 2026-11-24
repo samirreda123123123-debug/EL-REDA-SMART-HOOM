@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, CSSProperties } from "react";
+import { useState, useRef, useEffect, useCallback, CSSProperties } from "react";
 
 /* ══════════════════════════════════════════════
    DATA TYPES
@@ -13,7 +13,7 @@ interface ButtonCfg {
 
 interface Device {
   id:      string;
-  name:    string;   // e.g. صالة
+  name:    string;   // e.g. الصالة
   ip:      string;
   buttons: ButtonCfg[];
 }
@@ -21,9 +21,9 @@ interface Device {
 type ModeAction = "on" | "off" | "skip";
 
 interface ModeStep {
-  deviceId:   string;
+  deviceId:    string;
   buttonIndex: number;
-  action:     ModeAction;
+  action:      ModeAction;
 }
 
 interface SmartMode {
@@ -33,9 +33,23 @@ interface SmartMode {
   steps: ModeStep[];
 }
 
+interface EspStatusResponse {
+  r1?: number;
+  r2?: number;
+  r3?: number;
+  r4?: number;
+  r5?: number;
+  r6?: number;
+  r7?: number;
+  ldr?: number;
+}
+
 /* ══════════════════════════════════════════════
-   CONSTANTS
+   CONSTANTS & STORAGE KEYS
 ══════════════════════════════════════════════ */
+
+const STORAGE_DEVICES_KEY = "alreda_smarthome_devices_v1";
+const STORAGE_MODES_KEY   = "alreda_smarthome_modes_v1";
 
 const DEVICE_OPTIONS = [
   { icon:"💡", label:"إضاءة عامة" },
@@ -61,14 +75,14 @@ const makeDefaultButtons = (): ButtonCfg[] => [
   { label:"التلفزيون",        icon:"📺", enabled:true,  on:false },
   { label:"المكيف",           icon:"❄️", enabled:true,  on:false },
   { label:"القفل الذكي",      icon:"🔒", enabled:true,  on:false },
-  { label:"لوحة التحكم",      icon:"🎛️", enabled:false, on:false },
+  { label:"المروحة",          icon:"🌀", enabled:true,  on:false },
 ];
 
 const mkId = () => Math.random().toString(36).slice(2,8);
 
 const INITIAL_DEVICES: Device[] = [
-  { id:mkId(), name:"الصالة",   ip:"192.168.1.100", buttons:makeDefaultButtons() },
-  { id:mkId(), name:"غرفة النوم", ip:"192.168.1.101", buttons:makeDefaultButtons() },
+  { id:mkId(), name:"الصالة",     ip:"192.168.8.200", buttons:makeDefaultButtons() },
+  { id:mkId(), name:"غرفة النوم", ip:"192.168.8.201", buttons:makeDefaultButtons() },
 ];
 
 const makeModeSteps = (devices:Device[], actions:Record<number,ModeAction>):ModeStep[] =>
@@ -100,6 +114,25 @@ const INITIAL_MODES:SmartMode[] = [
 ];
 
 const MODE_ICONS = ["🌙","☀️","🌆","🚪","🎬","💤","🏠","✨"];
+
+/* ══════════════════════════════════════════════
+   HTTP HELPER (ESP8266 COMMUNICATION)
+══════════════════════════════════════════════ */
+
+async function fetchWithTimeout(url: string, timeoutMs = 2000): Promise<Response> {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      signal: controller.signal,
+      cache: "no-store",
+    });
+    return response;
+  } finally {
+    clearTimeout(id);
+  }
+}
 
 /* ══════════════════════════════════════════════
    PALETTE
@@ -135,35 +168,176 @@ const inputBase: CSSProperties = {
 type Page = "home" | "settings";
 
 export default function App() {
-  const [page, setPage]           = useState<Page>("home");
-  const [devices, setDevices]     = useState<Device[]>(INITIAL_DEVICES);
-  const [modes, setModes]         = useState<SmartMode[]>(INITIAL_MODES);
-  const [activeId, setActiveId]   = useState(INITIAL_DEVICES[0].id);
-  const [settingsTab,setSettingsTab] = useState<SettingsTab>("devices");
+  const [page, setPage] = useState<Page>("home");
+
+  // تحميل الأجهزة المحفوظة من localStorage
+  const [devices, setDevices] = useState<Device[]>(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_DEVICES_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      }
+    } catch {}
+    return INITIAL_DEVICES;
+  });
+
+  // تحميل الأوضاع الذكية المحفوظة
+  const [modes, setModes] = useState<SmartMode[]>(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_MODES_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) return parsed;
+      }
+    } catch {}
+    return INITIAL_MODES;
+  });
+
+  const [activeId, setActiveId]       = useState(() => devices[0]?.id ?? "");
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>("devices");
+  const [isConnected, setIsConnected] = useState<boolean>(false);
+
+  // حفظ الأجهزة تلقائياً عند أي تغيير
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_DEVICES_KEY, JSON.stringify(devices));
+    } catch {}
+  }, [devices]);
+
+  // حفظ الأوضاع الذكية تلقائياً عند أي تغيير
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_MODES_KEY, JSON.stringify(modes));
+    } catch {}
+  }, [modes]);
 
   const updateDevices = (fn: (d: Device[]) => Device[]) => setDevices(fn);
 
-  const toggleButton = (devId:string, btnIdx:number) => {
-    updateDevices(ds => ds.map(d =>
-      d.id !== devId ? d :
-      { ...d, buttons: d.buttons.map((b,i) => i!==btnIdx ? b : { ...b, on:!b.on }) }
-    ));
-  };
+  // تحديث حالات الـ 7 أزرار بناءً على JSON القادم من ESP8266
+  const syncDeviceFromJson = useCallback((devId: string, data: EspStatusResponse) => {
+    const states = [
+      data.r1 === 1,
+      data.r2 === 1,
+      data.r3 === 1,
+      data.r4 === 1,
+      data.r5 === 1,
+      data.r6 === 1,
+      data.r7 === 1,
+    ];
+    setDevices(ds => ds.map(d => {
+      if (d.id !== devId) return d;
+      return {
+        ...d,
+        buttons: d.buttons.map((b, idx) => ({
+          ...b,
+          on: states[idx] !== undefined ? states[idx] : b.on,
+        })),
+      };
+    }));
+  }, []);
 
   const activeDevice = devices.find(d => d.id === activeId) ?? devices[0];
 
-  const applyMode = (mode:SmartMode) => {
+  // جلب الحالة دورياً كل 1.5 ثانية لمزامنة ريموت الـ RF 433MHz وحالة الاتصال
+  useEffect(() => {
+    if (!activeDevice?.ip || page !== "home") return;
+
+    let cancelled = false;
+
+    const pollStatus = async () => {
+      try {
+        const cleanIp = activeDevice.ip.trim();
+        const res = await fetchWithTimeout(`http://${cleanIp}/status`, 1500);
+        if (!res.ok) throw new Error("HTTP error");
+        const data: EspStatusResponse = await res.json();
+        if (!cancelled) {
+          setIsConnected(true);
+          syncDeviceFromJson(activeDevice.id, data);
+        }
+      } catch {
+        if (!cancelled) {
+          setIsConnected(false);
+        }
+      }
+    };
+
+    pollStatus();
+    const timer = setInterval(pollStatus, 1500);
+
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [activeDevice?.id, activeDevice?.ip, page, syncDeviceFromJson]);
+
+  // إرسال أمر Toggle عند الضغط على أي زر من الـ 7 أزرار
+  const toggleButton = async (devId: string, btnIdx: number) => {
+    const targetDev = devices.find(d => d.id === devId);
+    if (!targetDev) return;
+
+    // 1. تحديث فوري للواجهة لاستجابة سريعة للمستخدم
+    updateDevices(ds => ds.map(d =>
+      d.id !== devId ? d :
+      { ...d, buttons: d.buttons.map((b, i) => i !== btnIdx ? b : { ...b, on: !b.on }) }
+    ));
+
+    // 2. إرسال الطلب الفعلي إلى ESP-12F (/toggle?ch=1..7)
+    try {
+      const channel = btnIdx + 1; // 1 to 7
+      const cleanIp = targetDev.ip.trim();
+      const res = await fetchWithTimeout(`http://${cleanIp}/toggle?ch=${channel}`, 2000);
+      if (res.ok) {
+        const data: EspStatusResponse = await res.json();
+        setIsConnected(true);
+        syncDeviceFromJson(devId, data);
+      }
+    } catch {
+      setIsConnected(false);
+    }
+  };
+
+  // تنفيذ وضع ذكي (Smart Mode) وإرسال أوامر /set لكل خط
+  const applyMode = async (mode: SmartMode) => {
+    // 1. تحديث الواجهة فوراً
     updateDevices(ds => ds.map(device => ({
       ...device,
-      buttons:device.buttons.map((button,buttonIndex) => {
+      buttons: device.buttons.map((button, buttonIndex) => {
         const step = mode.steps.find(s =>
-          s.deviceId===device.id && s.buttonIndex===buttonIndex
+          s.deviceId === device.id && s.buttonIndex === buttonIndex
         );
-        return !step || step.action==="skip"
+        return !step || step.action === "skip"
           ? button
-          : { ...button, on:step.action==="on" };
+          : { ...button, on: step.action === "on" };
       }),
     })));
+
+    // 2. إرسال أوامر /set?ch=X&state=Y لكل خط غير متخطى
+    const activeSteps = mode.steps.filter(s => s.action !== "skip");
+    for (const step of activeSteps) {
+      const targetDev = devices.find(d => d.id === step.deviceId);
+      if (!targetDev) continue;
+
+      const ch = step.buttonIndex + 1;
+      const stateVal = step.action === "on" ? 1 : 0;
+      const cleanIp = targetDev.ip.trim();
+
+      try {
+        const res = await fetchWithTimeout(
+          `http://${cleanIp}/set?ch=${ch}&state=${stateVal}`,
+          2000
+        );
+        if (res.ok && targetDev.id === activeDevice?.id) {
+          const data: EspStatusResponse = await res.json();
+          setIsConnected(true);
+          syncDeviceFromJson(targetDev.id, data);
+        }
+      } catch {
+        if (targetDev.id === activeDevice?.id) {
+          setIsConnected(false);
+        }
+      }
+    }
   };
 
   return (
@@ -184,6 +358,7 @@ export default function App() {
             devices={devices} activeId={activeId}
             setActiveId={setActiveId} toggleButton={toggleButton}
             modes={modes} applyMode={applyMode}
+            isConnected={isConnected}
             goSettings={() => { setSettingsTab("devices"); setPage("settings"); }}
             goModeSettings={() => { setSettingsTab("modes"); setPage("settings"); }}
           />
@@ -203,12 +378,13 @@ export default function App() {
    HOME PAGE
 ══════════════════════════════════════════════ */
 
-function HomePage({ devices, activeId, setActiveId, toggleButton, modes, applyMode, goSettings, goModeSettings }:{
+function HomePage({ devices, activeId, setActiveId, toggleButton, modes, applyMode, isConnected, goSettings, goModeSettings }:{
   devices:Device[]; activeId:string;
   setActiveId:(id:string)=>void;
   toggleButton:(devId:string, btnIdx:number)=>void;
   modes:SmartMode[];
   applyMode:(mode:SmartMode)=>void;
+  isConnected:boolean;
   goSettings:()=>void;
   goModeSettings:()=>void;
 }) {
@@ -231,13 +407,14 @@ function HomePage({ devices, activeId, setActiveId, toggleButton, modes, applyMo
           <div>
             <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:6 }}>
               <div style={{ width:8,height:8,borderRadius:"50%",
-                background:C.green, boxShadow:`0 0 10px rgba(74,222,128,0.6)`,
+                background: isConnected ? C.green : C.red,
+                boxShadow: isConnected ? `0 0 10px rgba(74,222,128,0.6)` : `0 0 10px rgba(248,113,113,0.6)`,
                 animation:"pulse 2s ease-in-out infinite" }} />
-              <span style={{ ...MONO, fontSize:11, color:C.textMute, letterSpacing:"0.08em" }}>
-                متصل · {dev.ip}
+              <span style={{ ...MONO, fontSize:11, color: isConnected ? C.textMute : C.red, letterSpacing:"0.08em" }}>
+                {isConnected ? `متصل · ${dev.ip}` : `غير متصل · ${dev.ip}`}
               </span>
             </div>
-            <div style={{ fontSize:28,fontWeight:700,lineHeight:1.1 }}>المنزل الذكي</div>
+            <div style={{ fontSize:28,fontWeight:700,lineHeight:1.1 }}>الرضا سمارت هوم</div>
             <div style={{ fontSize:13,color:C.textDim,marginTop:7 }}>
               {active} جهاز شغال من {visible.length}
             </div>
@@ -444,7 +621,7 @@ function SettingsPage({ devices, activeId, setActiveId, updateDevices, modes, se
     updateDevices(ds => ds.map(d => d.id===id ? {...d,...patch} : d));
 
   const addDevice = () => {
-    const d:Device = { id:mkId(), name:"جهاز جديد", ip:"192.168.1.xxx", buttons:makeDefaultButtons() };
+    const d:Device = { id:mkId(), name:"جهاز جديد", ip:"192.168.8.202", buttons:makeDefaultButtons() };
     updateDevices(ds=>[...ds,d]);
     setActiveId(d.id);
     setTab("buttons");
@@ -729,7 +906,7 @@ function DeviceSettingCard({ device,active,onSelect,onNameChange,onIpChange,onRe
         <div>
           <div style={{ fontSize:11,color:C.textMute,marginBottom:6 }}>عنوان IP</div>
           <input value={device.ip} onChange={e=>onIpChange(e.target.value)}
-            placeholder="192.168.1.x"
+            placeholder="192.168.8.200"
             style={{ ...inputBase,...MONO,width:"100%",padding:"9px 12px",fontSize:12,letterSpacing:"0.05em" }}
             onFocus={e=>{ e.target.style.borderColor="rgba(99,179,255,0.5)"; e.target.style.background="rgba(59,130,246,0.09)"; }}
             onBlur={e=>{  e.target.style.borderColor="rgba(255,255,255,0.13)"; e.target.style.background="rgba(255,255,255,0.07)"; }}
