@@ -11,9 +11,12 @@ interface ButtonCfg {
   on:      boolean;
 }
 
+type DeviceTypeKey = "smart_home_7ch";
+
 interface Device {
   id:      string;
-  name:    string;   // e.g. الصالة
+  name:    string;
+  type:    DeviceTypeKey;
   ip:      string;
   buttons: ButtonCfg[];
 }
@@ -48,8 +51,12 @@ interface EspStatusResponse {
    CONSTANTS & STORAGE KEYS
 ══════════════════════════════════════════════ */
 
-const STORAGE_DEVICES_KEY = "alreda_smarthome_devices_v1";
-const STORAGE_MODES_KEY   = "alreda_smarthome_modes_v1";
+const STORAGE_DEVICES_KEY = "alreda_smarthome_devices_v2";
+const STORAGE_MODES_KEY   = "alreda_smarthome_modes_v2";
+
+const DEVICE_TYPES: { key: DeviceTypeKey; label: string; channels: number }[] = [
+  { key: "smart_home_7ch", label: "سمارت هوم 7 خطوط", channels: 7 },
+];
 
 const DEVICE_OPTIONS = [
   { icon:"💡", label:"إضاءة عامة" },
@@ -69,21 +76,16 @@ const DEVICE_OPTIONS = [
 ];
 
 const makeDefaultButtons = (): ButtonCfg[] => [
-  { label:"الإضاءة الرئيسية", icon:"💡", enabled:true,  on:false },
-  { label:"الإضاءة الهادئة",  icon:"🕯️", enabled:true,  on:false },
-  { label:"نور أمام المنزل",  icon:"🏮", enabled:true,  on:false },
-  { label:"التلفزيون",        icon:"📺", enabled:true,  on:false },
-  { label:"المكيف",           icon:"❄️", enabled:true,  on:false },
-  { label:"القفل الذكي",      icon:"🔒", enabled:true,  on:false },
-  { label:"المروحة",          icon:"🌀", enabled:true,  on:false },
+  { label:"الإضاءة الرئيسية", icon:"💡", enabled:true, on:false },
+  { label:"الإضاءة الهادئة",  icon:"🕯️", enabled:true, on:false },
+  { label:"نور أمام المنزل",  icon:"🏮", enabled:true, on:false },
+  { label:"التلفزيون",        icon:"📺", enabled:true, on:false },
+  { label:"المكيف",           icon:"❄️", enabled:true, on:false },
+  { label:"القفل الذكي",      icon:"🔒", enabled:true, on:false },
+  { label:"المروحة",          icon:"🌀", enabled:true, on:false },
 ];
 
 const mkId = () => Math.random().toString(36).slice(2,8);
-
-const INITIAL_DEVICES: Device[] = [
-  { id:mkId(), name:"الصالة",     ip:"192.168.8.200", buttons:makeDefaultButtons() },
-  { id:mkId(), name:"غرفة النوم", ip:"192.168.8.201", buttons:makeDefaultButtons() },
-];
 
 const makeModeSteps = (devices:Device[], actions:Record<number,ModeAction>):ModeStep[] =>
   devices.flatMap(device =>
@@ -94,32 +96,13 @@ const makeModeSteps = (devices:Device[], actions:Record<number,ModeAction>):Mode
     }))
   );
 
-const INITIAL_MODES:SmartMode[] = [
-  {
-    id:mkId(), name:"وضع النوم", icon:"🌙",
-    steps:makeModeSteps(INITIAL_DEVICES,{0:"off",1:"off",2:"off",3:"off",5:"on"}),
-  },
-  {
-    id:mkId(), name:"وضع الصباح", icon:"☀️",
-    steps:makeModeSteps(INITIAL_DEVICES,{0:"on",1:"off",2:"off",3:"off"}),
-  },
-  {
-    id:mkId(), name:"وضع المساء", icon:"🌆",
-    steps:makeModeSteps(INITIAL_DEVICES,{0:"off",1:"on",2:"on"}),
-  },
-  {
-    id:mkId(), name:"خارج المنزل", icon:"🚪",
-    steps:makeModeSteps(INITIAL_DEVICES,{0:"off",1:"off",2:"off",3:"off",4:"off",5:"on"}),
-  },
-];
-
 const MODE_ICONS = ["🌙","☀️","🌆","🚪","🎬","💤","🏠","✨"];
 
 /* ══════════════════════════════════════════════
-   HTTP HELPER (ESP8266 COMMUNICATION)
+   HTTP HELPER (FAST LOW-LATENCY ESP8266 FETCH)
 ══════════════════════════════════════════════ */
 
-async function fetchWithTimeout(url: string, timeoutMs = 2000): Promise<Response> {
+async function fetchWithTimeout(url: string, timeoutMs = 1200): Promise<Response> {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -170,19 +153,18 @@ type Page = "home" | "settings";
 export default function App() {
   const [page, setPage] = useState<Page>("home");
 
-  // تحميل الأجهزة المحفوظة من localStorage
+  // يبدأ التطبيق فارغاً تماماً عند الفتح لأول مرة
   const [devices, setDevices] = useState<Device[]>(() => {
     try {
       const saved = localStorage.getItem(STORAGE_DEVICES_KEY);
       if (saved) {
         const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+        if (Array.isArray(parsed)) return parsed;
       }
     } catch {}
-    return INITIAL_DEVICES;
+    return [];
   });
 
-  // تحميل الأوضاع الذكية المحفوظة
   const [modes, setModes] = useState<SmartMode[]>(() => {
     try {
       const saved = localStorage.getItem(STORAGE_MODES_KEY);
@@ -191,21 +173,32 @@ export default function App() {
         if (Array.isArray(parsed)) return parsed;
       }
     } catch {}
-    return INITIAL_MODES;
+    return [];
   });
 
-  const [activeId, setActiveId]       = useState(() => devices[0]?.id ?? "");
+  const [activeId, setActiveId]       = useState<string>(() => devices[0]?.id ?? "");
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("devices");
   const [isConnected, setIsConnected] = useState<boolean>(false);
+  const [pendingKey, setPendingKey]   = useState<string | null>(null);
 
-  // حفظ الأجهزة تلقائياً عند أي تغيير
+  const isPollingRef = useRef<boolean>(false);
+
+  // ضمان تحديد جهاز نشط صحيح إذا تم إضافة أول جهاز أو حذف جهاز
+  useEffect(() => {
+    if (devices.length === 0) {
+      if (activeId !== "") setActiveId("");
+      setIsConnected(false);
+    } else if (!devices.some(d => d.id === activeId)) {
+      setActiveId(devices[0].id);
+    }
+  }, [devices, activeId]);
+
   useEffect(() => {
     try {
       localStorage.setItem(STORAGE_DEVICES_KEY, JSON.stringify(devices));
     } catch {}
   }, [devices]);
 
-  // حفظ الأوضاع الذكية تلقائياً عند أي تغيير
   useEffect(() => {
     try {
       localStorage.setItem(STORAGE_MODES_KEY, JSON.stringify(modes));
@@ -214,7 +207,7 @@ export default function App() {
 
   const updateDevices = (fn: (d: Device[]) => Device[]) => setDevices(fn);
 
-  // تحديث حالات الـ 7 أزرار بناءً على JSON القادم من ESP8266
+  // تحديث حالات الـ 7 أزرار فقط من بيانات JSON الفعلية القادمة من البوردة
   const syncDeviceFromJson = useCallback((devId: string, data: EspStatusResponse) => {
     const states = [
       data.r1 === 1,
@@ -227,6 +220,8 @@ export default function App() {
     ];
     setDevices(ds => ds.map(d => {
       if (d.id !== devId) return d;
+      const hasChanged = d.buttons.some((b, idx) => b.on !== states[idx]);
+      if (!hasChanged) return d;
       return {
         ...d,
         buttons: d.buttons.map((b, idx) => ({
@@ -239,16 +234,18 @@ export default function App() {
 
   const activeDevice = devices.find(d => d.id === activeId) ?? devices[0];
 
-  // جلب الحالة دورياً كل 1.5 ثانية لمزامنة ريموت الـ RF 433MHz وحالة الاتصال
+  // مزامنة سريعة كل 500 مللي ثانية لقراءة حالة البوردة لحظياً
   useEffect(() => {
     if (!activeDevice?.ip || page !== "home") return;
 
     let cancelled = false;
 
     const pollStatus = async () => {
+      if (isPollingRef.current) return;
+      isPollingRef.current = true;
       try {
         const cleanIp = activeDevice.ip.trim();
-        const res = await fetchWithTimeout(`http://${cleanIp}/status`, 1500);
+        const res = await fetchWithTimeout(`http://${cleanIp}/status`, 1000);
         if (!res.ok) throw new Error("HTTP error");
         const data: EspStatusResponse = await res.json();
         if (!cancelled) {
@@ -259,85 +256,98 @@ export default function App() {
         if (!cancelled) {
           setIsConnected(false);
         }
+      } finally {
+        isPollingRef.current = false;
       }
     };
 
     pollStatus();
-    const timer = setInterval(pollStatus, 1500);
+    const timer = setInterval(pollStatus, 500);
 
     return () => {
       cancelled = true;
       clearInterval(timer);
+      isPollingRef.current = false;
     };
   }, [activeDevice?.id, activeDevice?.ip, page, syncDeviceFromJson]);
 
-  // إرسال أمر Toggle عند الضغط على أي زر من الـ 7 أزرار
-  const toggleButton = async (devId: string, btnIdx: number) => {
+  // إرسال أمر Toggle: لا تتغير حالة الزر إلا بعد استلام رد البوردة المؤكد
+  const toggleButton = async (devId: string, btnIdx: number): Promise<boolean> => {
     const targetDev = devices.find(d => d.id === devId);
-    if (!targetDev) return;
+    if (!targetDev) return false;
 
-    // 1. تحديث فوري للواجهة لاستجابة سريعة للمستخدم
-    updateDevices(ds => ds.map(d =>
-      d.id !== devId ? d :
-      { ...d, buttons: d.buttons.map((b, i) => i !== btnIdx ? b : { ...b, on: !b.on }) }
-    ));
+    const lockKey = `${devId}-${btnIdx}`;
+    if (pendingKey === lockKey) return false;
+    setPendingKey(lockKey);
 
-    // 2. إرسال الطلب الفعلي إلى ESP-12F (/toggle?ch=1..7)
     try {
-      const channel = btnIdx + 1; // 1 to 7
+      const channel = btnIdx + 1;
       const cleanIp = targetDev.ip.trim();
-      const res = await fetchWithTimeout(`http://${cleanIp}/toggle?ch=${channel}`, 2000);
-      if (res.ok) {
-        const data: EspStatusResponse = await res.json();
-        setIsConnected(true);
-        syncDeviceFromJson(devId, data);
-      }
+      const res = await fetchWithTimeout(`http://${cleanIp}/toggle?ch=${channel}`, 1500);
+      if (!res.ok) throw new Error("Failed");
+      const data: EspStatusResponse = await res.json();
+      setIsConnected(true);
+      syncDeviceFromJson(devId, data);
+      return true;
     } catch {
       setIsConnected(false);
+      return false;
+    } finally {
+      setPendingKey(null);
     }
   };
 
-  // تنفيذ وضع ذكي (Smart Mode) وإرسال أوامر /set لكل خط
-  const applyMode = async (mode: SmartMode) => {
-    // 1. تحديث الواجهة فوراً
-    updateDevices(ds => ds.map(device => ({
-      ...device,
-      buttons: device.buttons.map((button, buttonIndex) => {
-        const step = mode.steps.find(s =>
-          s.deviceId === device.id && s.buttonIndex === buttonIndex
-        );
-        return !step || step.action === "skip"
-          ? button
-          : { ...button, on: step.action === "on" };
-      }),
-    })));
-
-    // 2. إرسال أوامر /set?ch=X&state=Y لكل خط غير متخطى
+  // تنفيذ وضع ذكي: يرسل الأوامر بالتوازي ولا يفعّل الوضع إلا عند نجاح الاتصال الفعلي
+  const applyMode = async (mode: SmartMode): Promise<boolean> => {
     const activeSteps = mode.steps.filter(s => s.action !== "skip");
-    for (const step of activeSteps) {
-      const targetDev = devices.find(d => d.id === step.deviceId);
-      if (!targetDev) continue;
 
-      const ch = step.buttonIndex + 1;
-      const stateVal = step.action === "on" ? 1 : 0;
-      const cleanIp = targetDev.ip.trim();
-
+    if (activeSteps.length === 0) {
+      if (!activeDevice?.ip) return false;
       try {
-        const res = await fetchWithTimeout(
-          `http://${cleanIp}/set?ch=${ch}&state=${stateVal}`,
-          2000
-        );
-        if (res.ok && targetDev.id === activeDevice?.id) {
-          const data: EspStatusResponse = await res.json();
+        const res = await fetchWithTimeout(`http://${activeDevice.ip.trim()}/status`, 1200);
+        if (res.ok) {
           setIsConnected(true);
-          syncDeviceFromJson(targetDev.id, data);
+          return true;
         }
       } catch {
-        if (targetDev.id === activeDevice?.id) {
-          setIsConnected(false);
-        }
+        setIsConnected(false);
       }
+      return false;
     }
+
+    let anySuccess = false;
+
+    await Promise.all(
+      activeSteps.map(async (step) => {
+        const targetDev = devices.find(d => d.id === step.deviceId);
+        if (!targetDev) return;
+
+        const ch = step.buttonIndex + 1;
+        const stateVal = step.action === "on" ? 1 : 0;
+        const cleanIp = targetDev.ip.trim();
+
+        try {
+          const res = await fetchWithTimeout(
+            `http://${cleanIp}/set?ch=${ch}&state=${stateVal}`,
+            1500
+          );
+          if (res.ok) {
+            anySuccess = true;
+            const data: EspStatusResponse = await res.json();
+            if (targetDev.id === activeDevice?.id) {
+              setIsConnected(true);
+            }
+            syncDeviceFromJson(targetDev.id, data);
+          }
+        } catch {
+          if (targetDev.id === activeDevice?.id) {
+            setIsConnected(false);
+          }
+        }
+      })
+    );
+
+    return anySuccess;
   };
 
   return (
@@ -348,7 +358,7 @@ export default function App() {
         @keyframes slideIn{from{opacity:0;transform:translateX(18px)}to{opacity:1;transform:translateX(0)}}
         @keyframes dropIn{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:translateY(0)}}
         input::placeholder{color:rgba(147,197,253,0.30)}
-        input,button{font-family:'Outfit',sans-serif}
+        input,button,select{font-family:'Outfit',sans-serif}
         ::-webkit-scrollbar{width:4px}
         ::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.12);border-radius:4px}
       `}</style>
@@ -359,6 +369,7 @@ export default function App() {
             setActiveId={setActiveId} toggleButton={toggleButton}
             modes={modes} applyMode={applyMode}
             isConnected={isConnected}
+            pendingKey={pendingKey}
             goSettings={() => { setSettingsTab("devices"); setPage("settings"); }}
             goModeSettings={() => { setSettingsTab("modes"); setPage("settings"); }}
           />
@@ -378,25 +389,40 @@ export default function App() {
    HOME PAGE
 ══════════════════════════════════════════════ */
 
-function HomePage({ devices, activeId, setActiveId, toggleButton, modes, applyMode, isConnected, goSettings, goModeSettings }:{
+function HomePage({ devices, activeId, setActiveId, toggleButton, modes, applyMode, isConnected, pendingKey, goSettings, goModeSettings }:{
   devices:Device[]; activeId:string;
   setActiveId:(id:string)=>void;
-  toggleButton:(devId:string, btnIdx:number)=>void;
+  toggleButton:(devId:string, btnIdx:number)=>Promise<boolean>;
   modes:SmartMode[];
-  applyMode:(mode:SmartMode)=>void;
+  applyMode:(mode:SmartMode)=>Promise<boolean>;
   isConnected:boolean;
+  pendingKey:string | null;
   goSettings:()=>void;
   goModeSettings:()=>void;
 }) {
-  const dev = devices.find(d=>d.id===activeId) ?? devices[0];
-  const visible = dev.buttons.filter(b => b.enabled);
-  const active  = dev.buttons.filter(b => b.on && b.enabled).length;
-  const [appliedMode,setAppliedMode] = useState<string|null>(null);
+  const [appliedMode, setAppliedMode] = useState<string|null>(null);
+  const [failedMode, setFailedMode]   = useState<string|null>(null);
 
-  const runMode = (mode:SmartMode) => {
-    applyMode(mode);
-    setAppliedMode(mode.id);
-    setTimeout(()=>setAppliedMode(null),1800);
+  const hasDevices = devices.length > 0;
+  const dev = hasDevices ? (devices.find(d=>d.id===activeId) ?? devices[0]) : null;
+  const visible = dev ? dev.buttons.filter(b => b.enabled) : [];
+  const active  = dev ? dev.buttons.filter(b => b.on && b.enabled).length : 0;
+
+  const runMode = async (mode: SmartMode) => {
+    if (!isConnected) {
+      setFailedMode(mode.id);
+      setTimeout(() => setFailedMode(null), 1600);
+      return;
+    }
+
+    const success = await applyMode(mode);
+    if (success) {
+      setAppliedMode(mode.id);
+      setTimeout(() => setAppliedMode(null), 1800);
+    } else {
+      setFailedMode(mode.id);
+      setTimeout(() => setFailedMode(null), 1600);
+    }
   };
 
   return (
@@ -407,16 +433,24 @@ function HomePage({ devices, activeId, setActiveId, toggleButton, modes, applyMo
           <div>
             <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:6 }}>
               <div style={{ width:8,height:8,borderRadius:"50%",
-                background: isConnected ? C.green : C.red,
-                boxShadow: isConnected ? `0 0 10px rgba(74,222,128,0.6)` : `0 0 10px rgba(248,113,113,0.6)`,
-                animation:"pulse 2s ease-in-out infinite" }} />
-              <span style={{ ...MONO, fontSize:11, color: isConnected ? C.textMute : C.red, letterSpacing:"0.08em" }}>
-                {isConnected ? `متصل · ${dev.ip}` : `غير متصل · ${dev.ip}`}
+                background: !hasDevices ? C.textMute : isConnected ? C.green : C.red,
+                boxShadow: !hasDevices ? "none" : isConnected ? `0 0 10px rgba(74,222,128,0.6)` : `0 0 10px rgba(248,113,113,0.6)`,
+                animation: hasDevices ? "pulse 2s ease-in-out infinite" : "none" }} />
+              <span style={{ ...MONO, fontSize:11,
+                color: !hasDevices ? C.textMute : isConnected ? C.textMute : C.red,
+                letterSpacing:"0.08em" }}>
+                {!hasDevices
+                  ? "لا توجد أجهزة مضافة"
+                  : isConnected
+                    ? `متصل · ${dev!.ip}`
+                    : `غير متصل · ${dev!.ip}`}
               </span>
             </div>
             <div style={{ fontSize:28,fontWeight:700,lineHeight:1.1 }}>الرضا سمارت هوم</div>
             <div style={{ fontSize:13,color:C.textDim,marginTop:7 }}>
-              {active} جهاز شغال من {visible.length}
+              {hasDevices
+                ? `${active} جهاز شغال من ${visible.length}`
+                : "ابدأ بإضافة أول جهاز من الإعدادات"}
             </div>
           </div>
           <button onClick={goSettings} style={{
@@ -427,126 +461,180 @@ function HomePage({ devices, activeId, setActiveId, toggleButton, modes, applyMo
         </div>
       </div>
 
-      {/* ── Smart modes ── */}
-      <div style={{ padding:"0 22px 20px" }}>
-        <div style={{ display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10 }}>
-          <div>
-            <div style={{ fontSize:15,fontWeight:700 }}>الأوضاع الذكية</div>
-            <div style={{ fontSize:11,color:C.textMute,marginTop:2 }}>نفّذ عدة أوامر بلمسة واحدة</div>
-          </div>
-          <button onClick={goModeSettings} style={{
-            fontSize:11,color:C.cyan,cursor:"pointer",padding:"6px 10px",
-            borderRadius:9,background:"rgba(59,130,246,0.10)",
-            border:"1px solid rgba(99,179,255,0.18)",
-          }}>برمجة الأوضاع</button>
-        </div>
-        <div style={{ display:"flex",gap:9,overflowX:"auto",paddingBottom:4 }}>
-          {modes.map(mode => {
-            const applied = appliedMode===mode.id;
-            const commands = mode.steps.filter(s=>s.action!=="skip").length;
-            return (
-              <button key={mode.id} onClick={()=>runMode(mode)} style={{
-                minWidth:158,height:66,padding:"9px 11px 9px 13px",
-                borderRadius:16,cursor:"pointer",textAlign:"right",
-                flexShrink:0,transition:"all 0.25s",direction:"rtl",
-                display:"flex",alignItems:"center",gap:10,
-                background:applied
-                  ? "linear-gradient(135deg,rgba(34,197,94,0.28),rgba(22,163,74,0.12))"
-                  : "linear-gradient(145deg,rgba(59,130,246,0.13),rgba(255,255,255,0.04))",
-                border:applied
-                  ? "1px solid rgba(74,222,128,0.45)"
-                  : "1px solid rgba(99,179,255,0.18)",
-                boxShadow:applied ? "0 6px 20px rgba(34,197,94,0.18)" : "0 4px 16px rgba(0,0,0,0.18)",
-              }}>
-                <div style={{ flex:1,minWidth:0 }}>
-                  <div style={{ fontSize:12,fontWeight:600,color:applied ? C.green : C.text,
-                    whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis" }}>
-                    {applied ? "تم التفعيل" : mode.name}
-                  </div>
-                  <div style={{ ...MONO,fontSize:8,color:C.textMute,marginTop:4 }}>
-                    {commands} أوامر
-                  </div>
-                </div>
-                <div style={{
-                  width:38,height:38,borderRadius:12,flexShrink:0,fontSize:20,
-                  display:"flex",alignItems:"center",justifyContent:"center",
-                  background:applied ? "rgba(74,222,128,0.12)" : "rgba(59,130,246,0.12)",
-                  border:applied ? "1px solid rgba(74,222,128,0.20)" : "1px solid rgba(99,179,255,0.12)",
-                }}>
-                  {applied ? "✓" : mode.icon}
-                </div>
-              </button>
-            );
-          })}
-          {modes.length===0 && (
-            <button onClick={goModeSettings} style={{
-              width:"100%",padding:16,borderRadius:16,cursor:"pointer",
-              color:C.textDim,background:C.surface,
-              border:"1.5px dashed rgba(99,179,255,0.22)",
-            }}>＋ أضف أول وضع ذكي</button>
-          )}
-        </div>
-      </div>
-
-      {/* ── Room selector and controls ── */}
-      <div style={{ flex:1,padding:"0 16px 36px" }}>
-        <div style={{
-          padding:10,borderRadius:24,
-          background:"linear-gradient(155deg,rgba(59,130,246,0.08),rgba(255,255,255,0.025))",
-          border:"1px solid rgba(99,179,255,0.15)",
-          boxShadow:"0 14px 36px rgba(0,0,0,0.18)",
-        }}>
+      {/* ── شاشة الترحيب والتنبيه عند فتح التطبيق لأول مرة بدون أجهزة ── */}
+      {!hasDevices ? (
+        <div style={{ flex:1, padding:"10px 22px 40px", display:"flex", flexDirection:"column", justifyContent:"center" }}>
           <div style={{
-            display:"flex",gap:4,overflowX:"auto",padding:4,
-            borderRadius:16,background:"rgba(3,10,30,0.42)",
-            border:"1px solid rgba(255,255,255,0.08)",
+            padding:"28px 22px",
+            borderRadius:24,
+            background:"linear-gradient(155deg,rgba(59,130,246,0.12),rgba(255,255,255,0.03))",
+            border:"1px solid rgba(99,179,255,0.22)",
+            boxShadow:"0 14px 36px rgba(0,0,0,0.22)",
+            textAlign:"center",
           }}>
-            {devices.map(d => (
-              <button key={d.id} onClick={()=>setActiveId(d.id)} style={{
-                flex:1,minWidth:110,padding:"10px 16px",borderRadius:12,
-                cursor:"pointer",whiteSpace:"nowrap",fontSize:13,fontWeight:600,
-                transition:"all 0.2s",
-                background:d.id===activeId ? "linear-gradient(135deg,#3b82f6,#2563eb)" : "transparent",
-                border:d.id===activeId ? "1px solid rgba(99,179,255,0.45)" : "1px solid transparent",
-                color:d.id===activeId ? "#fff" : C.textDim,
-                boxShadow:d.id===activeId ? "0 4px 14px rgba(37,99,235,0.35)" : "none",
-              }}>{d.name}</button>
-            ))}
-          </div>
-
-          <div key={dev.id} style={{
-            display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,
-            alignContent:"start",marginTop:10,animation:"dropIn 0.2s ease",
-          }}>
-            {dev.buttons.map((btn, i) =>
-              btn.enabled ? (
-                <DeviceCard key={i} btn={btn} onToggle={()=>toggleButton(dev.id, i)} />
-              ) : null
-            )}
-            {/* settings shortcut */}
+            <div style={{
+              width:64, height:64, borderRadius:20, margin:"0 auto 16px",
+              background:"rgba(59,130,246,0.16)",
+              border:"1px solid rgba(99,179,255,0.32)",
+              display:"flex", alignItems:"center", justifyContent:"center",
+              fontSize:30,
+            }}>🏠</div>
+            <div style={{ fontSize:19, fontWeight:700, color:C.text, marginBottom:8 }}>
+              مرحباً بك في الرضا سمارت هوم
+            </div>
+            <div style={{ fontSize:13, color:C.textDim, lineHeight:1.75, marginBottom:22 }}>
+              لا توجد أي أجهزة أو أزرار أو أوضاع مضافة حتى الآن.
+              <br />
+              يرجى الدخول إلى الإعدادات لإضافة جهازك وضبط عنوان الـ IP والأزرار.
+            </div>
             <button onClick={goSettings} style={{
-              height:126,borderRadius:18,cursor:"pointer",
-              background:"rgba(59,130,246,0.025)",
-              border:"1.5px dashed rgba(99,179,255,0.16)",
-              display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:8,
+              width:"100%", padding:"14px 18px", borderRadius:16, cursor:"pointer",
+              fontSize:14, fontWeight:700, border:"none", color:"#fff",
+              background:"linear-gradient(135deg,#3b82f6,#2563eb)",
+              boxShadow:"0 6px 24px rgba(37,99,235,0.45)",
+              display:"flex", alignItems:"center", justifyContent:"center", gap:8,
             }}>
-              <span style={{ fontSize:24,opacity:.35 }}>⚙️</span>
-              <span style={{ fontSize:12,color:C.textMute }}>الإعدادات</span>
+              <span>⚙️</span>
+              <span>الذهاب إلى الإعدادات لإضافة جهاز</span>
             </button>
           </div>
         </div>
-      </div>
+      ) : (
+        <>
+          {/* ── Smart modes ── */}
+          <div style={{ padding:"0 22px 20px" }}>
+            <div style={{ display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10 }}>
+              <div>
+                <div style={{ fontSize:15,fontWeight:700 }}>الأوضاع الذكية</div>
+                <div style={{ fontSize:11,color:C.textMute,marginTop:2 }}>نفّذ عدة أوامر بلمسة واحدة</div>
+              </div>
+              <button onClick={goModeSettings} style={{
+                fontSize:11,color:C.cyan,cursor:"pointer",padding:"6px 10px",
+                borderRadius:9,background:"rgba(59,130,246,0.10)",
+                border:"1px solid rgba(99,179,255,0.18)",
+              }}>برمجة الأوضاع</button>
+            </div>
+            <div style={{ display:"flex",gap:9,overflowX:"auto",paddingBottom:4 }}>
+              {modes.map(mode => {
+                const applied  = appliedMode === mode.id;
+                const failed   = failedMode === mode.id;
+                const commands = mode.steps.filter(s=>s.action!=="skip").length;
+                return (
+                  <button key={mode.id} onClick={()=>runMode(mode)} style={{
+                    minWidth:158,height:66,padding:"9px 11px 9px 13px",
+                    borderRadius:16,cursor:"pointer",textAlign:"right",
+                    flexShrink:0,transition:"all 0.25s",direction:"rtl",
+                    display:"flex",alignItems:"center",gap:10,
+                    background: applied
+                      ? "linear-gradient(135deg,rgba(34,197,94,0.28),rgba(22,163,74,0.12))"
+                      : failed
+                      ? "linear-gradient(135deg,rgba(248,113,113,0.25),rgba(220,38,38,0.12))"
+                      : "linear-gradient(145deg,rgba(59,130,246,0.13),rgba(255,255,255,0.04))",
+                    border: applied
+                      ? "1px solid rgba(74,222,128,0.45)"
+                      : failed
+                      ? "1px solid rgba(248,113,113,0.45)"
+                      : "1px solid rgba(99,179,255,0.18)",
+                    boxShadow: applied ? "0 6px 20px rgba(34,197,94,0.18)" : "0 4px 16px rgba(0,0,0,0.18)",
+                  }}>
+                    <div style={{ flex:1,minWidth:0 }}>
+                      <div style={{ fontSize:12,fontWeight:600,
+                        color: applied ? C.green : failed ? C.red : C.text,
+                        whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis" }}>
+                        {applied ? "تم التفعيل" : failed ? "غير متصل!" : mode.name}
+                      </div>
+                      <div style={{ ...MONO,fontSize:8,color:C.textMute,marginTop:4 }}>
+                        {commands} أوامر
+                      </div>
+                    </div>
+                    <div style={{
+                      width:38,height:38,borderRadius:12,flexShrink:0,fontSize:20,
+                      display:"flex",alignItems:"center",justifyContent:"center",
+                      background: applied ? "rgba(74,222,128,0.12)" : failed ? "rgba(248,113,113,0.12)" : "rgba(59,130,246,0.12)",
+                      border: applied ? "1px solid rgba(74,222,128,0.20)" : failed ? "1px solid rgba(248,113,113,0.20)" : "1px solid rgba(99,179,255,0.12)",
+                    }}>
+                      {applied ? "✓" : failed ? "✕" : mode.icon}
+                    </div>
+                  </button>
+                );
+              })}
+              {modes.length===0 && (
+                <button onClick={goModeSettings} style={{
+                  width:"100%",padding:16,borderRadius:16,cursor:"pointer",
+                  color:C.textDim,background:C.surface,
+                  border:"1.5px dashed rgba(99,179,255,0.22)",
+                }}>＋ أضف أول وضع ذكي</button>
+              )}
+            </div>
+          </div>
+
+          {/* ── Room selector and controls ── */}
+          <div style={{ flex:1,padding:"0 16px 36px" }}>
+            <div style={{
+              padding:10,borderRadius:24,
+              background:"linear-gradient(155deg,rgba(59,130,246,0.08),rgba(255,255,255,0.025))",
+              border:"1px solid rgba(99,179,255,0.15)",
+              boxShadow:"0 14px 36px rgba(0,0,0,0.18)",
+            }}>
+              <div style={{
+                display:"flex",gap:4,overflowX:"auto",padding:4,
+                borderRadius:16,background:"rgba(3,10,30,0.42)",
+                border:"1px solid rgba(255,255,255,0.08)",
+              }}>
+                {devices.map(d => (
+                  <button key={d.id} onClick={()=>setActiveId(d.id)} style={{
+                    flex:1,minWidth:110,padding:"10px 16px",borderRadius:12,
+                    cursor:"pointer",whiteSpace:"nowrap",fontSize:13,fontWeight:600,
+                    transition:"all 0.2s",
+                    background:d.id===dev!.id ? "linear-gradient(135deg,#3b82f6,#2563eb)" : "transparent",
+                    border:d.id===dev!.id ? "1px solid rgba(99,179,255,0.45)" : "1px solid transparent",
+                    color:d.id===dev!.id ? "#fff" : C.textDim,
+                    boxShadow:d.id===dev!.id ? "0 4px 14px rgba(37,99,235,0.35)" : "none",
+                  }}>{d.name}</button>
+                ))}
+              </div>
+
+              <div key={dev!.id} style={{
+                display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,
+                alignContent:"start",marginTop:10,animation:"dropIn 0.2s ease",
+              }}>
+                {dev!.buttons.map((btn, i) =>
+                  btn.enabled ? (
+                    <DeviceCard
+                      key={i}
+                      btn={btn}
+                      isPending={pendingKey === `${dev!.id}-${i}`}
+                      onToggle={() => toggleButton(dev!.id, i)}
+                    />
+                  ) : null
+                )}
+                {/* settings shortcut */}
+                <button onClick={goSettings} style={{
+                  height:126,borderRadius:18,cursor:"pointer",
+                  background:"rgba(59,130,246,0.025)",
+                  border:"1.5px dashed rgba(99,179,255,0.16)",
+                  display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:8,
+                }}>
+                  <span style={{ fontSize:24,opacity:.35 }}>⚙️</span>
+                  <span style={{ fontSize:12,color:C.textMute }}>الإعدادات</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </>
+      )}
     </div>
   );
 }
 
-function DeviceCard({ btn, onToggle }:{ btn:ButtonCfg; onToggle:()=>void }) {
+function DeviceCard({ btn, isPending, onToggle }:{ btn:ButtonCfg; isPending:boolean; onToggle:()=>void }) {
   const { icon, label, on } = btn;
   return (
-    <button onClick={onToggle} style={{
+    <button onClick={onToggle} disabled={isPending} style={{
       height:126,borderRadius:18,padding:"15px 15px 13px",
       display:"flex",flexDirection:"column",justifyContent:"space-between",
-      textAlign:"right",direction:"rtl",cursor:"pointer",
+      textAlign:"right",direction:"rtl",cursor: isPending ? "wait" : "pointer",
+      opacity: isPending ? 0.75 : 1,
       background: on
         ? "linear-gradient(140deg,rgba(59,130,246,0.22),rgba(37,99,235,0.10))"
         : "rgba(255,255,255,0.05)",
@@ -554,14 +642,14 @@ function DeviceCard({ btn, onToggle }:{ btn:ButtonCfg; onToggle:()=>void }) {
       boxShadow: on
         ? "0 0 28px rgba(59,130,246,0.22),0 8px 24px rgba(0,0,0,0.35)"
         : "0 4px 18px rgba(0,0,0,0.28)",
-      transition:"all 0.25s ease",
+      transition:"all 0.2s ease",
     }}>
       <div style={{ display:"flex",alignItems:"flex-start",justifyContent:"space-between" }}>
         <ToggleSwitch on={on} />
         <span style={{
           fontSize:26,lineHeight:1,
           filter: on ? "drop-shadow(0 0 10px rgba(96,165,250,0.75))" : "grayscale(0.6) opacity(0.45)",
-          transition:"filter 0.3s",
+          transition:"filter 0.25s",
         }}>{icon}</span>
       </div>
       <div>
@@ -569,7 +657,7 @@ function DeviceCard({ btn, onToggle }:{ btn:ButtonCfg; onToggle:()=>void }) {
           color: on ? C.text : "rgba(255,255,255,0.42)" }}>{label}</div>
         <div style={{ ...MONO,fontSize:10,marginTop:3,
           color: on ? C.cyan : "rgba(255,255,255,0.18)",fontWeight:500 }}>
-          {on ? "● ACTIVE" : "○ OFF"}
+          {isPending ? "⏳ ..." : on ? "● ACTIVE" : "○ OFF"}
         </div>
       </div>
     </button>
@@ -582,13 +670,13 @@ function ToggleSwitch({ on }:{ on:boolean }) {
       position:"relative",width:36,height:20,borderRadius:10,flexShrink:0,
       background: on ? "linear-gradient(90deg,#3b82f6,#60a5fa)" : "rgba(255,255,255,0.14)",
       boxShadow: on ? `0 0 14px ${C.blueGlow}` : "none",
-      transition:"all 0.25s",
+      transition:"all 0.2s",
     }}>
       <div style={{
         position:"absolute",top:3,left: on ? 19 : 3,
         width:14,height:14,borderRadius:"50%",
         background: on ? "#fff" : "rgba(255,255,255,0.5)",
-        transition:"left 0.25s",
+        transition:"left 0.2s",
       }} />
     </div>
   );
@@ -598,7 +686,7 @@ function ToggleSwitch({ on }:{ on:boolean }) {
    SETTINGS PAGE
 ══════════════════════════════════════════════ */
 
-type SettingsTab = "devices" | "buttons" | "modes";
+type SettingsTab = "devices" | "buttons" | "modes" | "remote";
 
 function SettingsPage({ devices, activeId, setActiveId, updateDevices, modes, setModes, initialTab, onBack }:{
   devices:Device[]; activeId:string;
@@ -612,6 +700,16 @@ function SettingsPage({ devices, activeId, setActiveId, updateDevices, modes, se
   const [tab, setTab]     = useState<SettingsTab>(initialTab);
   const [saved, setSaved] = useState(false);
 
+  // حالات قائمة إضافة جهاز جديد
+  const [showAddForm, setShowAddForm]       = useState(false);
+  const [selectedType, setSelectedType]     = useState<DeviceTypeKey>("smart_home_7ch");
+  const [newDeviceName, setNewDeviceName]   = useState("الصالة");
+  const [newDeviceIp, setNewDeviceIp]       = useState("192.168.8.200");
+
+  // حالات أزرار برمجة الريموت كنترول السبعة
+  const [remoteProgIndex, setRemoteProgIndex]   = useState<number | null>(null);
+  const [remoteProgStatus, setRemoteProgStatus] = useState<Record<number, "idle" | "waiting" | "done" | "error">>({});
+
   const dev = devices.find(d=>d.id===activeId) ?? devices[0];
 
   const saveFlash = () => { setSaved(true); setTimeout(()=>setSaved(false),2000); };
@@ -620,17 +718,29 @@ function SettingsPage({ devices, activeId, setActiveId, updateDevices, modes, se
   const updateDev = (id:string, patch:Partial<Device>) =>
     updateDevices(ds => ds.map(d => d.id===id ? {...d,...patch} : d));
 
-  const addDevice = () => {
-    const d:Device = { id:mkId(), name:"جهاز جديد", ip:"192.168.8.202", buttons:makeDefaultButtons() };
-    updateDevices(ds=>[...ds,d]);
+  const confirmAddDevice = () => {
+    const cleanName = newDeviceName.trim() || "سمارت هوم 7 خطوط";
+    const cleanIp   = newDeviceIp.trim() || "192.168.8.200";
+    const d:Device = {
+      id: mkId(),
+      name: cleanName,
+      type: selectedType,
+      ip: cleanIp,
+      buttons: makeDefaultButtons(),
+    };
+    updateDevices(ds => [...ds, d]);
     setActiveId(d.id);
-    setTab("buttons");
+    setShowAddForm(false);
+    setNewDeviceName(`جهاز ${devices.length + 2}`);
+    setNewDeviceIp(`192.168.8.${200 + devices.length + 1}`);
   };
 
   const removeDevice = (id:string) => {
-    if(devices.length===1) return;
-    updateDevices(ds=>ds.filter(d=>d.id!==id));
-    if(activeId===id) setActiveId(devices.find(d=>d.id!==id)!.id);
+    updateDevices(ds => ds.filter(d => d.id !== id));
+    setModes(ms => ms.map(m => ({
+      ...m,
+      steps: m.steps.filter(s => s.deviceId !== id),
+    })));
   };
 
   /* button-level ops */
@@ -675,12 +785,48 @@ function SettingsPage({ devices, activeId, setActiveId, updateDevices, modes, se
       };
     }));
 
+  /* remote control programming op */
+  const programRemoteButton = async (btnIdx: number) => {
+    if (!dev?.ip) return;
+    setRemoteProgIndex(btnIdx);
+    setRemoteProgStatus(prev => ({ ...prev, [btnIdx]: "waiting" }));
+
+    try {
+      const ch = btnIdx + 1;
+      const cleanIp = dev.ip.trim();
+      const res = await fetchWithTimeout(`http://${cleanIp}/learn_rf?ch=${ch}`, 5000);
+      if (res.ok) {
+        setRemoteProgStatus(prev => ({ ...prev, [btnIdx]: "done" }));
+      } else {
+        setRemoteProgStatus(prev => ({ ...prev, [btnIdx]: "error" }));
+      }
+    } catch {
+      setRemoteProgStatus(prev => ({ ...prev, [btnIdx]: "error" }));
+    } finally {
+      setRemoteProgIndex(null);
+      setTimeout(() => {
+        setRemoteProgStatus(prev => ({ ...prev, [btnIdx]: "idle" }));
+      }, 2500);
+    }
+  };
+
   const SectionHead = ({ico,txt}:{ico:string;txt:string}) => (
     <div style={{ display:"flex",alignItems:"center",gap:8,marginBottom:12 }}>
       <span>{ico}</span>
       <span style={{ fontSize:11,fontWeight:600,color:C.textDim,
         letterSpacing:"0.10em",textTransform:"uppercase" }}>{txt}</span>
       <div style={{ flex:1,height:1,background:"rgba(255,255,255,0.08)" }} />
+    </div>
+  );
+
+  const EmptyDeviceNotice = () => (
+    <div style={{
+      padding:"20px 16px", borderRadius:18, textAlign:"center",
+      background:"rgba(59,130,246,0.07)",
+      border:"1px dashed rgba(99,179,255,0.25)",
+      color:C.textDim, fontSize:13, lineHeight:1.7,
+    }}>
+      لا توجد أجهزة مضافة حالياً. انتقل إلى تبويب «📡 الأجهزة» لإضافة جهاز أولاً.
     </div>
   );
 
@@ -698,19 +844,25 @@ function SettingsPage({ devices, activeId, setActiveId, updateDevices, modes, se
           }}>→</button>
           <div>
             <div style={{ fontSize:24,fontWeight:700 }}>الإعدادات</div>
-            <div style={{ fontSize:13,color:C.textMute,marginTop:2 }}>إدارة الأجهزة والأزرار</div>
+            <div style={{ fontSize:13,color:C.textMute,marginTop:2 }}>إدارة الأجهزة والأزرار والريموت</div>
           </div>
         </div>
 
         {/* tabs */}
-        <div style={{ display:"flex",gap:8,
+        <div style={{ display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:5,
           background:"rgba(255,255,255,0.05)",
           border:`1px solid ${C.border}`,
           borderRadius:14,padding:4 }}>
-          {([["devices","📡 الأجهزة"],["buttons","🎛️ الأزرار"],["modes","✨ الأوضاع"]] as const).map(([t,label])=>(
+          {([
+            ["devices","📡 الأجهزة"],
+            ["buttons","🎛️ الأزرار"],
+            ["modes","✨ الأوضاع"],
+            ["remote","📻 الريموت كنترول"],
+          ] as const).map(([t,label])=>(
             <button key={t} onClick={()=>setTab(t)} style={{
-              flex:1,padding:"9px 0",borderRadius:11,cursor:"pointer",
-              fontSize:13,fontWeight:600,transition:"all 0.2s",
+              padding:"9px 4px",borderRadius:11,cursor:"pointer",
+              fontSize:11,fontWeight:600,transition:"all 0.2s",
+              whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis",
               background: tab===t ? "linear-gradient(135deg,#3b82f6,#2563eb)" : "transparent",
               border: "none",
               color: tab===t ? "#fff" : C.textDim,
@@ -728,98 +880,287 @@ function SettingsPage({ devices, activeId, setActiveId, updateDevices, modes, se
           <>
             <SectionHead ico="📡" txt="قائمة الأجهزة" />
 
+            {devices.length === 0 && !showAddForm && (
+              <div style={{
+                padding:"18px 16px", borderRadius:18, textAlign:"center",
+                background:"rgba(59,130,246,0.07)",
+                border:"1px dashed rgba(99,179,255,0.25)",
+                color:C.textDim, fontSize:13, lineHeight:1.7,
+              }}>
+                القائمة فارغة حالياً. اضغط بالأسفل لإضافة جهاز جديد.
+              </div>
+            )}
+
             {devices.map(d => (
               <DeviceSettingCard key={d.id} device={d}
-                active={d.id===activeId}
+                active={d.id===dev?.id}
                 onSelect={()=>{ setActiveId(d.id); setTab("buttons"); }}
                 onNameChange={v=>updateDev(d.id,{name:v})}
                 onIpChange={v=>updateDev(d.id,{ip:v})}
                 onRemove={()=>removeDevice(d.id)}
-                canRemove={devices.length>1}
               />
             ))}
 
-            <button onClick={addDevice} style={{
-              width:"100%",padding:14,borderRadius:16,cursor:"pointer",
-              fontSize:14,fontWeight:600,
-              background:"rgba(59,130,246,0.10)",
-              border:"1.5px dashed rgba(99,179,255,0.30)",
-              color:C.cyan,display:"flex",alignItems:"center",justifyContent:"center",gap:8,
-            }}>
-              <span style={{ fontSize:18 }}>＋</span> إضافة جهاز جديد
-            </button>
+            {/* نموذج اختيار نوع الجهاز وإضافته */}
+            {showAddForm ? (
+              <div style={{
+                borderRadius:18, padding:16,
+                background:"rgba(59,130,246,0.10)",
+                border:"1px solid rgba(99,179,255,0.35)",
+                display:"flex", flexDirection:"column", gap:12,
+                animation:"dropIn 0.2s ease",
+              }}>
+                <div style={{ fontSize:13, fontWeight:700, color:C.cyan }}>
+                  إضافة جهاز جديد
+                </div>
+
+                <div>
+                  <div style={{ fontSize:11, color:C.textMute, marginBottom:6 }}>نوع الجهاز</div>
+                  <select
+                    value={selectedType}
+                    onChange={e => setSelectedType(e.target.value as DeviceTypeKey)}
+                    style={{
+                      ...inputBase, width:"100%", padding:"10px 12px", fontSize:13,
+                      cursor:"pointer", background:"#0e1d45",
+                    }}
+                  >
+                    {DEVICE_TYPES.map(dt => (
+                      <option key={dt.key} value={dt.key}>{dt.label}</option>
+                    ))}
+                  </select>
+                </div>
+
+                <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
+                  <div>
+                    <div style={{ fontSize:11, color:C.textMute, marginBottom:6 }}>اسم المكان / الغرفة</div>
+                    <input
+                      value={newDeviceName}
+                      onChange={e => setNewDeviceName(e.target.value)}
+                      placeholder="مثال: الصالة"
+                      style={{ ...inputBase, width:"100%", padding:"9px 12px", fontSize:13 }}
+                    />
+                  </div>
+                  <div>
+                    <div style={{ fontSize:11, color:C.textMute, marginBottom:6 }}>عنوان IP</div>
+                    <input
+                      value={newDeviceIp}
+                      onChange={e => setNewDeviceIp(e.target.value)}
+                      placeholder="192.168.8.200"
+                      style={{ ...inputBase, ...MONO, width:"100%", padding:"9px 12px", fontSize:12 }}
+                    />
+                  </div>
+                </div>
+
+                <div style={{ display:"flex", gap:8, marginTop:4 }}>
+                  <button onClick={confirmAddDevice} style={{
+                    flex:1, padding:"11px 14px", borderRadius:12, cursor:"pointer",
+                    fontSize:13, fontWeight:700, border:"none", color:"#fff",
+                    background:"linear-gradient(135deg,#3b82f6,#2563eb)",
+                  }}>
+                    ✓ تأكيد الإضافة
+                  </button>
+                  <button onClick={() => setShowAddForm(false)} style={{
+                    padding:"11px 14px", borderRadius:12, cursor:"pointer",
+                    fontSize:13, color:C.textDim,
+                    background:"rgba(255,255,255,0.06)",
+                    border:`1px solid ${C.border}`,
+                  }}>
+                    إلغاء
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <button onClick={() => setShowAddForm(true)} style={{
+                width:"100%",padding:14,borderRadius:16,cursor:"pointer",
+                fontSize:14,fontWeight:600,
+                background:"rgba(59,130,246,0.10)",
+                border:"1.5px dashed rgba(99,179,255,0.30)",
+                color:C.cyan,display:"flex",alignItems:"center",justifyContent:"center",gap:8,
+              }}>
+                <span style={{ fontSize:18 }}>＋</span> إضافة جهاز جديد
+              </button>
+            )}
           </>
         ) : tab==="buttons" ? (
-          <>
-            {/* device selector for buttons tab */}
-            <div>
-              <SectionHead ico="🏠" txt="اختر الجهاز" />
-              <div style={{ display:"flex",gap:8,overflowX:"auto",paddingBottom:4 }}>
-                {devices.map(d=>(
-                  <button key={d.id} onClick={()=>setActiveId(d.id)} style={{
-                    padding:"7px 16px",borderRadius:20,cursor:"pointer",whiteSpace:"nowrap",
-                    fontSize:13,fontWeight:600,transition:"all 0.2s",
-                    background: d.id===activeId ? "linear-gradient(135deg,#3b82f6,#2563eb)" : C.surface,
-                    border: d.id===activeId ? "1px solid rgba(99,179,255,0.5)" : `1px solid ${C.border}`,
-                    color: d.id===activeId ? "#fff" : C.textDim,
-                  }}>{d.name}</button>
-                ))}
+          devices.length === 0 ? <EmptyDeviceNotice /> : (
+            <>
+              <div>
+                <SectionHead ico="🏠" txt="اختر الجهاز" />
+                <div style={{ display:"flex",gap:8,overflowX:"auto",paddingBottom:4 }}>
+                  {devices.map(d=>(
+                    <button key={d.id} onClick={()=>setActiveId(d.id)} style={{
+                      padding:"7px 16px",borderRadius:20,cursor:"pointer",whiteSpace:"nowrap",
+                      fontSize:13,fontWeight:600,transition:"all 0.2s",
+                      background: d.id===dev!.id ? "linear-gradient(135deg,#3b82f6,#2563eb)" : C.surface,
+                      border: d.id===dev!.id ? "1px solid rgba(99,179,255,0.5)" : `1px solid ${C.border}`,
+                      color: d.id===dev!.id ? "#fff" : C.textDim,
+                    }}>{d.name}</button>
+                  ))}
+                </div>
               </div>
-            </div>
 
-            <div>
-              <SectionHead ico="🎛️" txt={`أزرار ${dev.name}`} />
-              <div style={{ background:C.surface,border:`1px solid ${C.border}`,
-                borderRadius:20,overflow:"hidden" }}>
-                {dev.buttons.map((btn,i)=>(
-                  <ButtonSettingRow key={i} index={i} btn={btn}
-                    last={i===6}
-                    onLabelChange={v=>updateBtn(i,{label:v})}
-                    onIconChange={v=>updateBtn(i,{icon:v})}
-                    onEnabledChange={v=>updateBtn(i,{enabled:v})}
-                  />
-                ))}
+              <div>
+                <SectionHead ico="🎛️" txt={`أزرار ${dev!.name}`} />
+                <div style={{ background:C.surface,border:`1px solid ${C.border}`,
+                  borderRadius:20,overflow:"hidden" }}>
+                  {dev!.buttons.map((btn,i)=>(
+                    <ButtonSettingRow key={i} index={i} btn={btn}
+                      last={i===6}
+                      onLabelChange={v=>updateBtn(i,{label:v})}
+                      onIconChange={v=>updateBtn(i,{icon:v})}
+                      onEnabledChange={v=>updateBtn(i,{enabled:v})}
+                    />
+                  ))}
+                </div>
               </div>
-            </div>
-          </>
-        ) : (
-          <>
-            <div>
-              <SectionHead ico="✨" txt="برمجة الأوضاع الذكية" />
-              <div style={{
-                padding:"12px 14px",borderRadius:15,marginBottom:14,
-                background:"rgba(59,130,246,0.08)",
-                border:"1px solid rgba(99,179,255,0.16)",
-                fontSize:12,lineHeight:1.7,color:C.textDim,
+            </>
+          )
+        ) : tab==="modes" ? (
+          devices.length === 0 ? <EmptyDeviceNotice /> : (
+            <>
+              <div>
+                <SectionHead ico="✨" txt="برمجة الأوضاع الذكية" />
+                <div style={{
+                  padding:"12px 14px",borderRadius:15,marginBottom:14,
+                  background:"rgba(59,130,246,0.08)",
+                  border:"1px solid rgba(99,179,255,0.16)",
+                  fontSize:12,lineHeight:1.7,color:C.textDim,
+                }}>
+                  اكتب اسم الوضع، ثم اختر ما يحدث لكل زر عند تشغيله. خيار «بدون تغيير» يحافظ على حالة الزر الحالية.
+                </div>
+                <div style={{ display:"flex",flexDirection:"column",gap:14 }}>
+                  {modes.map(mode=>(
+                    <ModeSettingCard
+                      key={mode.id}
+                      mode={mode}
+                      devices={devices}
+                      onNameChange={name=>updateMode(mode.id,{name})}
+                      onIconChange={icon=>updateMode(mode.id,{icon})}
+                      onStepChange={(deviceId,buttonIndex,action)=>
+                        updateModeStep(mode.id,deviceId,buttonIndex,action)
+                      }
+                      onRemove={()=>removeMode(mode.id)}
+                    />
+                  ))}
+                </div>
+              </div>
+              <button onClick={addMode} style={{
+                width:"100%",padding:14,borderRadius:16,cursor:"pointer",
+                fontSize:14,fontWeight:600,
+                background:"rgba(59,130,246,0.10)",
+                border:"1.5px dashed rgba(99,179,255,0.30)",
+                color:C.cyan,display:"flex",alignItems:"center",justifyContent:"center",gap:8,
               }}>
-                اكتب اسم الوضع، ثم اختر ما يحدث لكل زر عند تشغيله. خيار «بدون تغيير» يحافظ على حالة الزر الحالية.
+                <span style={{ fontSize:18 }}>＋</span> إضافة وضع جديد
+              </button>
+            </>
+          )
+        ) : (
+          /* ── تبويب الريموت كنترول (7 أزرار برمجة) ── */
+          devices.length === 0 ? <EmptyDeviceNotice /> : (
+            <>
+              <div>
+                <SectionHead ico="🏠" txt="اختر الجهاز" />
+                <div style={{ display:"flex",gap:8,overflowX:"auto",paddingBottom:4 }}>
+                  {devices.map(d=>(
+                    <button key={d.id} onClick={()=>setActiveId(d.id)} style={{
+                      padding:"7px 16px",borderRadius:20,cursor:"pointer",whiteSpace:"nowrap",
+                      fontSize:13,fontWeight:600,transition:"all 0.2s",
+                      background: d.id===dev!.id ? "linear-gradient(135deg,#3b82f6,#2563eb)" : C.surface,
+                      border: d.id===dev!.id ? "1px solid rgba(99,179,255,0.5)" : `1px solid ${C.border}`,
+                      color: d.id===dev!.id ? "#fff" : C.textDim,
+                    }}>{d.name}</button>
+                  ))}
+                </div>
               </div>
-              <div style={{ display:"flex",flexDirection:"column",gap:14 }}>
-                {modes.map(mode=>(
-                  <ModeSettingCard
-                    key={mode.id}
-                    mode={mode}
-                    devices={devices}
-                    onNameChange={name=>updateMode(mode.id,{name})}
-                    onIconChange={icon=>updateMode(mode.id,{icon})}
-                    onStepChange={(deviceId,buttonIndex,action)=>
-                      updateModeStep(mode.id,deviceId,buttonIndex,action)
-                    }
-                    onRemove={()=>removeMode(mode.id)}
-                  />
-                ))}
+
+              <div>
+                <SectionHead ico="📻" txt={`برمجة أزرار الريموت كنترول · ${dev!.name}`} />
+                <div style={{
+                  padding:"12px 14px",borderRadius:15,marginBottom:14,
+                  background:"rgba(59,130,246,0.08)",
+                  border:"1px solid rgba(99,179,255,0.16)",
+                  fontSize:12,lineHeight:1.7,color:C.textDim,
+                }}>
+                  اضغط على زر البرمجة المقابل لكل خط لربطه بزر من ريموت الـ RF الخاص بك.
+                </div>
+
+                <div style={{
+                  background:C.surface,
+                  border:`1px solid ${C.border}`,
+                  borderRadius:20,
+                  overflow:"hidden",
+                }}>
+                  {dev!.buttons.map((btn, i) => {
+                    const status = remoteProgStatus[i] ?? "idle";
+                    const isWaiting = remoteProgIndex === i || status === "waiting";
+                    return (
+                      <div key={i} style={{
+                        display:"flex", alignItems:"center", gap:12,
+                        padding:"14px 16px",
+                        borderBottom: i === 6 ? "none" : "1px solid rgba(255,255,255,0.06)",
+                      }}>
+                        <div style={{
+                          width:40, height:40, borderRadius:11, fontSize:20, flexShrink:0,
+                          background:"rgba(59,130,246,0.10)",
+                          border:"1px solid rgba(99,179,255,0.18)",
+                          display:"flex", alignItems:"center", justifyContent:"center",
+                        }}>
+                          {btn.icon}
+                        </div>
+
+                        <div style={{ flex:1, minWidth:0 }}>
+                          <div style={{ ...MONO, fontSize:9, color:C.textMute, marginBottom:3, letterSpacing:"0.06em" }}>
+                            زر الريموت {i + 1}
+                          </div>
+                          <div style={{
+                            fontSize:13, fontWeight:600, color:C.text,
+                            whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis",
+                          }}>
+                            {btn.label}
+                          </div>
+                        </div>
+
+                        <button
+                          onClick={() => programRemoteButton(i)}
+                          disabled={remoteProgIndex !== null}
+                          style={{
+                            padding:"9px 14px",
+                            borderRadius:12,
+                            cursor: remoteProgIndex !== null ? "wait" : "pointer",
+                            fontSize:12,
+                            fontWeight:600,
+                            flexShrink:0,
+                            transition:"all 0.2s",
+                            border: status === "done"
+                              ? "1px solid rgba(74,222,128,0.45)"
+                              : status === "error"
+                              ? "1px solid rgba(248,113,113,0.45)"
+                              : "1px solid rgba(99,179,255,0.35)",
+                            background: status === "done"
+                              ? "linear-gradient(135deg,rgba(34,197,94,0.28),rgba(22,163,74,0.15))"
+                              : status === "error"
+                              ? "linear-gradient(135deg,rgba(248,113,113,0.25),rgba(220,38,38,0.12))"
+                              : "linear-gradient(135deg,#3b82f6,#2563eb)",
+                            color: status === "done" ? C.green : status === "error" ? C.red : "#fff",
+                            boxShadow: status === "idle" && !isWaiting ? "0 4px 14px rgba(37,99,235,0.35)" : "none",
+                          }}
+                        >
+                          {isWaiting
+                            ? "⏳ جاري الاستقبال..."
+                            : status === "done"
+                            ? "✓ تم الحفظ"
+                            : status === "error"
+                            ? "✕ غير متصل"
+                            : `برمجة زر ${i + 1}`}
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
               </div>
-            </div>
-            <button onClick={addMode} style={{
-              width:"100%",padding:14,borderRadius:16,cursor:"pointer",
-              fontSize:14,fontWeight:600,
-              background:"rgba(59,130,246,0.10)",
-              border:"1.5px dashed rgba(99,179,255,0.30)",
-              color:C.cyan,display:"flex",alignItems:"center",justifyContent:"center",gap:8,
-            }}>
-              <span style={{ fontSize:18 }}>＋</span> إضافة وضع جديد
-            </button>
-          </>
+            </>
+          )
         )}
 
         {/* save */}
@@ -844,12 +1185,14 @@ function SettingsPage({ devices, activeId, setActiveId, updateDevices, modes, se
 }
 
 /* ── Device card in settings ── */
-function DeviceSettingCard({ device,active,onSelect,onNameChange,onIpChange,onRemove,canRemove }:{
+function DeviceSettingCard({ device,active,onSelect,onNameChange,onIpChange,onRemove }:{
   device:Device; active:boolean;
   onSelect:()=>void; onNameChange:(v:string)=>void; onIpChange:(v:string)=>void;
-  onRemove:()=>void; canRemove:boolean;
+  onRemove:()=>void;
 }) {
   const enabledCount = device.buttons.filter(b=>b.enabled).length;
+  const typeLabel = DEVICE_TYPES.find(t => t.key === device.type)?.label ?? "سمارت هوم 7 خطوط";
+
   return (
     <div style={{
       borderRadius:18, overflow:"hidden",
@@ -860,16 +1203,16 @@ function DeviceSettingCard({ device,active,onSelect,onNameChange,onIpChange,onRe
       {/* top bar */}
       <div style={{ display:"flex",alignItems:"center",justifyContent:"space-between",
         padding:"14px 16px 10px" }}>
-        <div style={{ display:"flex",alignItems:"center",gap:8 }}>
+        <div style={{ display:"flex",alignItems:"center",gap:8,flexWrap:"wrap" }}>
           <div style={{ width:8,height:8,borderRadius:"50%",
             background: active ? C.green : "rgba(255,255,255,0.2)",
             boxShadow: active ? `0 0 8px rgba(74,222,128,0.6)` : "none",
             animation: active ? "pulse 2s ease-in-out infinite" : "none" }} />
           <span style={{ fontSize:13,fontWeight:600,color: active ? C.cyan : C.textDim }}>
-            {active ? "الجهاز الحالي" : "جهاز"}
+            {typeLabel}
           </span>
           <span style={{ ...MONO,fontSize:10,color:C.textMute }}>
-            {enabledCount} أزرار مفعّلة
+            · {enabledCount} أزرار
           </span>
         </div>
         <div style={{ display:"flex",gap:8 }}>
@@ -880,15 +1223,13 @@ function DeviceSettingCard({ device,active,onSelect,onNameChange,onIpChange,onRe
             border:"1px solid rgba(99,179,255,0.30)",
             color:C.cyan,
           }}>تعديل الأزرار</button>
-          {canRemove && (
-            <button onClick={onRemove} style={{
-              width:30,height:30,borderRadius:8,cursor:"pointer",
-              background:"rgba(248,113,113,0.10)",
-              border:"1px solid rgba(248,113,113,0.25)",
-              color:C.red,fontSize:14,
-              display:"flex",alignItems:"center",justifyContent:"center",
-            }}>✕</button>
-          )}
+          <button onClick={onRemove} style={{
+            width:30,height:30,borderRadius:8,cursor:"pointer",
+            background:"rgba(248,113,113,0.10)",
+            border:"1px solid rgba(248,113,113,0.25)",
+            color:C.red,fontSize:14,
+            display:"flex",alignItems:"center",justifyContent:"center",
+          }}>✕</button>
         </div>
       </div>
 
